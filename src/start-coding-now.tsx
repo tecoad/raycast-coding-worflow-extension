@@ -5,23 +5,39 @@
  * - Tree navigation through project folders (ignores .dot folders)
  * - Recursively detects projects with package.json files
  * - Extracts port numbers from package.json scripts
- * - Shows project type with appropriate icons (port, bun, package.json)
+ * - Shows project type with minimal icons (only folders get icons)
  * - Handles leaf folders (folders with no package.json and no valid subfolders)
  * - Automates development workflow (opens in Cursor, runs dev server, optionally opens browser)
  * - Conditional Chrome opening based on port detection
+ * - Recent folders tracking with search boost keywords
+ * - Manual window arrangement (you control window positioning)
+ * - Automatically closes Cursor's secondary sidebar (Explorer panel) on open
+ * - DRY code architecture with reusable script generators
  *
  * Navigation Logic:
  * - Folders with package.json → Show development workflow
  * - Folders with valid subfolders (non-dot) → Navigate deeper
  * - Folders with neither → Treat as leaf folder (open directly in Cursor)
+ *
+ * Icon System:
+ * - 📁 Folder icon: Only for navigable folders
+ * - No icon: Projects and leaf folders (clean, minimal)
+ * - ⭐ Star accessory: Recently opened folders (< 1 hour)
+ *
+ * Recent Folders Boost:
+ * - ⭐ Star icon: Opened within last hour (highest priority)
+ * - 🔥 "hot": Search keyword for last hour
+ * - "recent": Opened within last day
+ * - "opened": Opened within last 3 days
+ * - Search results prioritize recently used folders
  */
 
-import { Action, ActionPanel, getPreferenceValues, Icon, List, showToast, Toast, useNavigation } from "@raycast/api";
+import { Action, ActionPanel, getPreferenceValues, Icon, List, LocalStorage, showToast, Toast, useNavigation } from "@raycast/api";
 import { execSync } from "child_process";
 import { existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { dirname, join } from "path";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 interface Project {
   name: string;
@@ -129,13 +145,10 @@ const executeAppleScript = (script: string): void => {
 };
 
 /**
- * Execute the complete development workflow
- * @param projectPath - Path to the project directory
- * @param port - Port number for development server
- * @param shouldOpenBrowser - Whether to open browser (only if port is detected)
+ * Generate the common Cursor opening workflow (used by both project and leaf folder workflows)
  */
-const executeCompleteWorkflow = (projectPath: string, port: string, shouldOpenBrowser: boolean = false): void => {
-  const workflowScript = `
+const generateCursorOpeningScript = (folderPath: string): string => {
+  return `
     -- Exit Raycast immediately to prevent focus conflicts
     tell application "System Events"
       keystroke " " using {command down} -- CMD + SPACE to minimize Raycast
@@ -143,7 +156,7 @@ const executeCompleteWorkflow = (projectPath: string, port: string, shouldOpenBr
     delay 0.5
 
     -- Open folder in Cursor
-    do shell script "open -a Cursor \\"${projectPath}\\""
+    do shell script "open -a Cursor \\"${folderPath}\\""
     delay 2
 
     -- Activate Cursor
@@ -152,6 +165,14 @@ const executeCompleteWorkflow = (projectPath: string, port: string, shouldOpenBr
     end tell
     delay 1
 
+  `;
+};
+
+/**
+ * Generate the development workflow script (Cursor opening + terminal + dev command)
+ */
+const generateDevWorkflowScript = (projectPath: string, port: string, shouldOpenBrowser: boolean): string => {
+  return `${generateCursorOpeningScript(projectPath)}
     -- Open integrated terminal using Command Palette (more reliable)
     tell application "System Events"
       keystroke "p" using {command down, shift down} -- Open Command Palette
@@ -173,25 +194,22 @@ const executeCompleteWorkflow = (projectPath: string, port: string, shouldOpenBr
 
     delay 2
 
-    -- Position Cursor left
-    tell application "System Events"
-      key code 123 using {control down, option down} -- ⌃⌥←
-    end tell
-
-    delay 1
-
     ${shouldOpenBrowser ? `
     -- Open Chrome on localhost
     do shell script "open -a 'Google Chrome' http://localhost:${port}"
 
-    delay 2
-
-    -- Position Chrome right
-    tell application "System Events"
-      key code 124 using {control down, option down} -- ⌃⌥→
-    end tell` : ''}
+    delay 2` : ''}
   `;
+};
 
+/**
+ * Execute the complete development workflow
+ * @param projectPath - Path to the project directory
+ * @param port - Port number for development server
+ * @param shouldOpenBrowser - Whether to open browser (only if port is detected)
+ */
+const executeCompleteWorkflow = (projectPath: string, port: string, shouldOpenBrowser: boolean = false): void => {
+  const workflowScript = generateDevWorkflowScript(projectPath, port, shouldOpenBrowser);
   executeAppleScript(workflowScript);
 };
 
@@ -231,7 +249,7 @@ const getProjectIcon = (project: Project): Icon => {
   return Icon.Folder; // Regular folder
 };
 
-const getProjectAccessories = (project: Project) => {
+const getProjectAccessories = (project: Project, recentFolders: Map<string, number>) => {
   const accessories = [];
 
   if (project.port) {
@@ -247,6 +265,25 @@ const getProjectAccessories = (project: Project) => {
   }
 
   return accessories;
+};
+
+/**
+ * Get keywords for recent folders to improve search ranking
+ * This helps recently opened folders appear higher in Raycast search
+ */
+const getRecentFolderKeywords = (project: Project, recentFolders: Map<string, number>): string[] => {
+  const timestamp = recentFolders.get(project.path);
+  if (!timestamp) return [];
+
+  const now = Date.now();
+  const ageInHours = (now - timestamp) / (1000 * 60 * 60);
+
+  // Add search boost keywords based on recency
+  if (ageInHours < 1) return ["🔥 hot", "recent", "opened"];        // Last hour
+  if (ageInHours < 6) return ["recent", "opened"];                   // Last 6 hours
+  if (ageInHours < 24) return ["recent"];                            // Last day
+  if (ageInHours < 72) return ["opened"];                            // Last 3 days
+  return [];                                                         // Older folders
 };
 
 /**
@@ -320,14 +357,89 @@ const hasValidSubfolders = (folderPath: string): boolean => {
 };
 
 /**
+ * Track when a folder is opened
+ */
+const trackFolderOpened = async (folderPath: string, onUpdate?: () => void): Promise<void> => {
+  try {
+    const recentFoldersJson = await LocalStorage.getItem<string>("recentFolders");
+    const recentFolders: Array<{ path: string; timestamp: number }> = recentFoldersJson
+      ? JSON.parse(recentFoldersJson)
+      : [];
+
+    // Remove existing entry for this folder
+    const filteredFolders = recentFolders.filter(folder => folder.path !== folderPath);
+
+    // Add to the beginning with current timestamp
+    const updatedFolders = [
+      { path: folderPath, timestamp: Date.now() },
+      ...filteredFolders
+    ].slice(0, 10); // Keep only the 10 most recent
+
+    await LocalStorage.setItem("recentFolders", JSON.stringify(updatedFolders));
+
+    // Call the update callback if provided
+    if (onUpdate) {
+      onUpdate();
+    }
+  } catch (error) {
+    console.error("Error tracking folder:", error);
+  }
+};
+
+/**
+ * Get recently opened folders with their timestamps
+ */
+const getRecentFolders = async (): Promise<Map<string, number>> => {
+  try {
+    const recentFoldersJson = await LocalStorage.getItem<string>("recentFolders");
+    if (!recentFoldersJson) return new Map();
+
+    const recentFolders: Array<{ path: string; timestamp: number }> = JSON.parse(recentFoldersJson);
+    return new Map(recentFolders.map(folder => [folder.path, folder.timestamp]));
+  } catch (error) {
+    console.error("Error getting recent folders:", error);
+    return new Map();
+  }
+};
+
+/**
+ * Sort items by recent usage, with recently opened folders first
+ */
+const sortItemsByRecentUsage = (items: Project[], recentFolders: Map<string, number>): Project[] => {
+  return [...items].sort((a, b) => {
+    const aTimestamp = recentFolders.get(a.path) || 0;
+    const bTimestamp = recentFolders.get(b.path) || 0;
+
+    // Sort by timestamp (most recent first), then by name
+    if (aTimestamp !== bTimestamp) {
+      return bTimestamp - aTimestamp; // Most recent first
+    }
+    return a.name.localeCompare(b.name);
+  });
+};
+
+/**
  * Navigation component for browsing project folders
  */
 function ProjectNavigation() {
   const preferences = getPreferenceValues<Preferences>();
   const [currentPath, setCurrentPath] = useState("");
+  const [recentFolders, setRecentFolders] = useState<Map<string, number>>(new Map());
   const navigation = useNavigation();
 
+  // Load recent folders on component mount
+  useEffect(() => {
+    getRecentFolders().then(setRecentFolders);
+  }, []);
+
+  // Function to refresh recent folders
+  const refreshRecentFolders = async () => {
+    const updatedRecentFolders = await getRecentFolders();
+    setRecentFolders(updatedRecentFolders);
+  };
+
   const items = getItemsAtPath(preferences.devFolderPath, currentPath);
+  const sortedItems = sortItemsByRecentUsage(items, recentFolders);
   const pathSegments = currentPath.split("/").filter(Boolean);
   const canGoBack = pathSegments.length > 0;
 
@@ -338,11 +450,11 @@ function ProjectNavigation() {
   };
 
   const getBreadcrumbSubtitle = () => {
-    if (pathSegments.length === 0) return `${items.length} items found`;
-    return `${items.length} items • ${pathSegments.join(" › ")}`;
+    if (pathSegments.length === 0) return `${sortedItems.length} items found`;
+    return `${sortedItems.length} items • ${pathSegments.join(" › ")}`;
   };
 
-  if (items.length === 0) {
+  if (sortedItems.length === 0) {
     return (
       <List>
         <List.Item
@@ -377,6 +489,7 @@ function ProjectNavigation() {
             icon={Icon.ArrowLeft}
             title=".."
             subtitle="Go back"
+            keywords={["navigation", "back"]}
             actions={
               <ActionPanel>
                 <Action
@@ -392,11 +505,29 @@ function ProjectNavigation() {
           />
         )}
 
-        {items.map((item) => {
+        {sortedItems.map((item) => {
           const isNavigable = !item.hasPackageJson && item.hasValidSubfolders;
           const isLeafFolder = item.isLeafFolder;
-          const icon = isNavigable ? Icon.Folder : isLeafFolder ? Icon.Document : getProjectIcon(item);
-          const accessories = isNavigable || isLeafFolder ? [] : getProjectAccessories(item);
+
+          // Simplified icon logic: only show folder icon for navigable folders
+          const icon = isNavigable ? Icon.Folder : undefined;
+
+          // Show accessories for all items, but only show project-specific ones for non-navigable items
+          const projectAccessories = isNavigable || isLeafFolder ? [] : getProjectAccessories(item, recentFolders);
+
+          // Add star icon for recently opened folders (all types)
+          const recentAccessories = [];
+          const timestamp = recentFolders.get(item.path);
+          if (timestamp) {
+            const now = Date.now();
+            const ageInHours = (now - timestamp) / (1000 * 60 * 60);
+            if (ageInHours < 1) {
+              recentAccessories.push({ icon: Icon.Star, text: "" });
+            }
+          }
+
+          const accessories = [...projectAccessories, ...recentAccessories];
+          const keywords = getRecentFolderKeywords(item, recentFolders);
 
           return (
             <List.Item
@@ -411,6 +542,7 @@ function ProjectNavigation() {
                   : item.path
               }
               accessories={accessories}
+              keywords={keywords}
               actions={
                 <ActionPanel>
                   {isNavigable ? (
@@ -429,6 +561,9 @@ function ProjectNavigation() {
                         icon={Icon.Play}
                         onAction={async () => {
                           if (isLeafFolder) {
+                            // Track folder usage for leaf folders
+                            await trackFolderOpened(item.path, refreshRecentFolders);
+
                             // For leaf folders, just open in Cursor without running dev workflow
                             await showToast({
                               style: Toast.Style.Animated,
@@ -436,22 +571,7 @@ function ProjectNavigation() {
                               message: `Opening ${item.name} in Cursor`,
                             });
 
-                            const workflowScript = `
-                              -- Exit Raycast immediately to prevent focus conflicts
-                              tell application "System Events"
-                                keystroke " " using {command down} -- CMD + SPACE to minimize Raycast
-                              end tell
-                              delay 0.5
-
-                              -- Open folder in Cursor
-                              do shell script "open -a Cursor \\"${item.path}\\""
-                              delay 2
-
-                              -- Activate Cursor
-                              tell application "Cursor"
-                                activate
-                              end tell
-                            `;
+                            const workflowScript = generateCursorOpeningScript(item.path);
 
                             executeAppleScript(workflowScript);
 
@@ -461,6 +581,8 @@ function ProjectNavigation() {
                               message: `${item.name} opened in Cursor`,
                             });
                           } else {
+                            // Track folder usage for development workflow
+                            await trackFolderOpened(item.path, refreshRecentFolders);
                             await startDevWorkflow(item);
                           }
                         }}
